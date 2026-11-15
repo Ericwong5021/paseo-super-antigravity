@@ -1,0 +1,419 @@
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { existsSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { delimiter, join } from "node:path";
+import { createInterface } from "node:readline";
+import { promisify } from "node:util";
+import { encodeUserTurn, parseAgyLine, type AgyEvent } from "./protocol";
+import { FULL_ACCESS_MODE_ID, nativeModeId } from "./permission-mode";
+
+const execFileAsync = promisify(execFile);
+
+let cachedAgyVersionPromise: Promise<string | null> | null = null;
+
+export async function detectAgyVersion(binary?: string): Promise<string | null> {
+  const agyBinary = resolveAgyBinary(binary);
+  try {
+    const { stdout, stderr } = await execFileAsync(agyBinary, ["--version"], {
+      timeout: 3000,
+      encoding: "utf8",
+    });
+    const output = (stdout || stderr || "").trim();
+    const match = output.match(/\b(\d+\.\d+(?:\.\d+)?)\b/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+export function clearAgyVersionCache(): void {
+  cachedAgyVersionPromise = null;
+}
+
+export async function getAgyVersion(
+  probe?: (binary?: string) => Promise<string | null> | string | null,
+  binary?: string,
+): Promise<string | null> {
+  if (probe) {
+    return await probe(binary);
+  }
+  if (!cachedAgyVersionPromise) {
+    cachedAgyVersionPromise = detectAgyVersion(binary);
+  }
+  return await cachedAgyVersionPromise;
+}
+
+export function isAgyVersionSupported(version: string | null): boolean {
+  if (!version) return false;
+  const match = version.match(/\b(\d+)\.(\d+)(?:\.(\d+))?\b/);
+  if (!match) return false;
+  const major = parseInt(match[1], 10);
+  const minor = parseInt(match[2], 10);
+  if (major > 1) return true;
+  if (major === 1 && minor >= 5) return true;
+  return false;
+}
+
+export interface AgyLaunchConfig {
+  cwd: string;
+  env?: Readonly<Record<string, string>>;
+  model?: string;
+  mode?: string;
+  /** Passes --effort (low|medium|high|xhigh|max). */
+  effort?: string;
+  /** Passes --agent to select an agent profile. */
+  agent?: string;
+  conversationId?: string;
+  /** Passes --dangerously-skip-permissions, so every tool runs without approval. */
+  skipPermissions: boolean;
+  /** Path to the JSON Schema the turn's answer must match (--json-schema). */
+  outputSchemaPath?: string;
+  /** Extra directory the model may read, used for the plugin's attached images. */
+  attachmentDir?: string;
+  /**
+   * A plugin-expanded skill's own directory, so the turn can read the scripts and templates the
+   * skill's instructions refer to. Set for that one turn's launch, like the schema file.
+   */
+  skillDir?: string;
+  /** Extra directories the user allowed, each its own --add-dir. */
+  addDirs?: readonly string[];
+  /** Passes --sandbox, which restricts what terminal commands may reach. */
+  sandbox?: boolean;
+  /**
+   * Omits `--disable-slash-commands`, so a turn whose text starts with `/<name>` is expanded into
+   * that command. Verified 2026-09-23: without this flag a command never expands, and with it a
+   * plain message that starts with `/` expands too — which is why only a command turn gets one.
+   */
+  allowSlashCommands?: boolean;
+  extraArgs?: readonly string[];
+  binary?: string;
+}
+
+export interface AgyProcessHandlers {
+  onEvent(event: AgyEvent): void;
+  onStderr(line: string): void;
+  onExit(info: { code: number | null; signal: NodeJS.Signals | null }): void;
+}
+
+/**
+ * The daemon is started by a GUI app and may not inherit `~/.local/bin` on its PATH, so an
+ * explicit lookup is required before falling back to PATH resolution.
+ */
+export function resolveAgyBinary(explicit?: string): string {
+  if (explicit && explicit.trim().length > 0) return explicit;
+  const fromEnv = process.env.PASEO_ANTIGRAVITY_BIN;
+  if (fromEnv && fromEnv.trim().length > 0) return fromEnv;
+  for (const candidate of installedAgyPaths()) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return "agy";
+}
+
+export interface AgyBinaryLookup {
+  /** The executable a launch would use, or `null` when no candidate is a runnable file. */
+  path: string | null;
+  /** Every candidate checked, in launch order, so a status diagnostic can name them. */
+  checked: readonly string[];
+}
+
+/**
+ * The `status()` view of `resolveAgyBinary`: the same lookup order, but proving the result is a
+ * runnable file instead of leaving that to `spawn` on the first turn. No process is started.
+ *
+ * `resolveAgyBinary` returns an override verbatim even when it does not exist, because that is what
+ * the launch will try; this returns `null` there so Paseo can say which path is wrong.
+ */
+export function locateAgyBinary(explicit?: string): AgyBinaryLookup {
+  const requested = explicit?.trim();
+  if (requested) return { path: executableAgy(requested), checked: [requested] };
+  const fromEnv = process.env.PASEO_ANTIGRAVITY_BIN?.trim();
+  if (fromEnv) return { path: executableAgy(fromEnv), checked: [fromEnv] };
+  const checked: string[] = [];
+  for (const candidate of installedAgyPaths()) {
+    checked.push(candidate);
+    if (isExecutableFile(candidate)) return { path: candidate, checked };
+  }
+  checked.push("agy on PATH");
+  return { path: findOnPath("agy"), checked };
+}
+
+/** A bare name is looked up on PATH, as `spawn` would; anything with a separator is a path. */
+function executableAgy(command: string): string | null {
+  if (command.includes("/") || command.includes("\\")) {
+    return isExecutableFile(command) ? command : null;
+  }
+  return findOnPath(command);
+}
+
+function isExecutableFile(candidate: string): boolean {
+  try {
+    const info = statSync(candidate);
+    if (!info.isFile()) return false;
+    return process.platform === "win32" || (info.mode & 0o111) !== 0;
+  } catch {
+    return false;
+  }
+}
+
+function findOnPath(command: string): string | null {
+  const env = process.env;
+  const pathValue = env.PATH ?? env.Path ?? "";
+  // Windows resolves an extensionless name through PATHEXT, as `spawn` does.
+  const suffixes =
+    process.platform === "win32" && !/\.[^./\\]+$/.test(command)
+      ? (env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter((suffix) => suffix.length > 0)
+      : [""];
+  for (const dir of pathValue.split(delimiter)) {
+    if (!dir) continue;
+    for (const suffix of suffixes) {
+      const candidate = join(dir, `${command}${suffix}`);
+      if (isExecutableFile(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+/**
+ * Where the installer puts `agy`: `~/.local/bin` on unix, `%LOCALAPPDATA%\agy\bin` on Windows. The
+ * Windows installer only adds its directory to the user PATH, which a daemon started before the
+ * install (or by a GUI app) never sees.
+ */
+function installedAgyPaths(): string[] {
+  if (process.platform !== "win32") return [join(homedir(), ".local", "bin", "agy")];
+  const localAppData = process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local");
+  return [join(localAppData, "agy", "bin", "agy.exe"), join(homedir(), ".local", "bin", "agy.exe")];
+}
+
+export function buildAgyArgs(config: AgyLaunchConfig): string[] {
+  const args = [
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--add-dir",
+    config.cwd,
+    // Antigravity resolves what the model may read against these directories, so the plugin's own
+    // attachments folder follows the workspace one; both are absolute. The user's extra
+    // directories are validated before they reach here.
+    ...(config.attachmentDir ? ["--add-dir", config.attachmentDir] : []),
+    ...(config.skillDir ? ["--add-dir", config.skillDir] : []),
+    ...(config.addDirs ?? []).flatMap((dir) => ["--add-dir", dir]),
+    // A command turn needs expansion; every other turn must keep plain text starting with `/` out
+    // of the CLI's slash parser (` /skills` and `/tasks` kill a print-mode turn outright). Plan
+    // mode is not an exception: agy ignores `--mode plan` while expansion is off, and turning it on
+    // to make the flag real costs the plugin's plan flow (see `ensureProcess` in provider.ts).
+    ...(config.allowSlashCommands === true ? [] : ["--disable-slash-commands"]),
+    // 0 waits until the turn completes; Paseo owns cancellation instead of a wall clock.
+    "--print-timeout",
+    "0",
+  ];
+  // `--effort` is only ever passed without `--model`: agy refuses every model id alongside it
+  // ("--effort is not supported for model X", "--model X conflicts with --effort=Y"), so the
+  // caller folds the tier into the slug (`resolveThinking`) whenever a model is selected.
+  if (config.model) args.push("--model", config.model);
+  if (config.effort) args.push("--effort", config.effort);
+  if (config.agent) args.push("--agent", config.agent);
+  // `default` is the implicit mode; agy accepts accept-edits, auto (1.3.5) and plan. `plan` never
+  // arrives here: the provider keeps Paseo's Plan mode to itself (see `ensureProcess`), because agy
+  // ignores `--mode plan` while slash-command expansion is disabled.
+  const mode = config.mode ? nativeModeId(config.mode) : undefined;
+  if (mode && mode !== "default") args.push("--mode", mode);
+  if (config.conversationId) args.push("--conversation", config.conversationId);
+  if (config.sandbox) args.push("--sandbox");
+  if (config.skipPermissions || config.mode === FULL_ACCESS_MODE_ID) args.push("--dangerously-skip-permissions");
+  // Launch-time only: the schema applies to every turn of the process, which is why a schema turn
+  // gets its own launch and the process is replaced again before the next plain turn.
+  if (config.outputSchemaPath) args.push("--json-schema", config.outputSchemaPath);
+  if (config.extraArgs) args.push(...config.extraArgs);
+  return args;
+}
+
+const SIGKILL_GRACE_MS = 5_000;
+
+/**
+ * One `agy` child process speaking NDJSON on stdin/stdout. A single process serves a whole
+ * Paseo session: each stdin line is one turn, and agy emits exactly one `result` per turn.
+ *
+ * Note that a line written while a turn is running is *queued* into a following turn, not
+ * steered into the running one, so the provider never advertises steering. That holds even with
+ * `"queuedMessages": "send-immediately"` in settings.json: 1.2.14 honours it in the TUI only, and a
+ * stream-json CLI still queues, mid-stream and mid-tool (fixtures/19-queued-send-immediately.txt).
+ */
+export class AgyProcess {
+  private child: ChildProcess | null = null;
+  private disposed = false;
+  private exitPromise: Promise<void> | null = null;
+  private resolveExit: (() => void) | null = null;
+  private exitInfo: { code: number | null; signal: NodeJS.Signals | null } = {
+    code: null,
+    signal: null,
+  };
+  private processExited = false;
+  private stdinClosed = false;
+  private readersPending = 0;
+  private reported = false;
+
+  constructor(
+    private readonly config: AgyLaunchConfig,
+    private readonly handlers: AgyProcessHandlers,
+  ) {}
+
+  get running(): boolean {
+    return this.child !== null;
+  }
+
+  /**
+   * Whether a turn can still be written. agy closes stdin when it gives up (it exits after every
+   * error result), and the pipe error may only surface on the next write, so `running` alone is not
+   * enough to decide that a process is still usable.
+   */
+  get acceptsInput(): boolean {
+    const stdin = this.child?.stdin;
+    return !!stdin && stdin.writable && !this.stdinClosed && !this.processExited;
+  }
+
+  get binary(): string {
+    return resolveAgyBinary(this.config.binary);
+  }
+
+  start(): void {
+    if (this.disposed) throw new Error("agy process has been disposed");
+    if (this.child) throw new Error("agy process is already running");
+
+    this.processExited = false;
+    this.stdinClosed = false;
+    this.readersPending = 0;
+    this.reported = false;
+    this.exitInfo = { code: null, signal: null };
+
+    const binary = this.binary;
+    const args = buildAgyArgs(this.config);
+    console.log(`[antigravity] spawn ${binary} ${args.join(" ")} (cwd ${this.config.cwd})`);
+
+    const child = spawn(binary, args, {
+      cwd: this.config.cwd,
+      env: { ...process.env, ...this.config.env } as NodeJS.ProcessEnv,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    this.child = child;
+    this.exitPromise = new Promise<void>((resolve) => {
+      this.resolveExit = resolve;
+    });
+
+    // Chunks do not align to line boundaries, so let readline own the framing.
+    if (child.stdout) {
+      const reader = createInterface({ input: child.stdout });
+      reader.on("line", (line) => {
+        const event = parseAgyLine(line);
+        if (event) this.handlers.onEvent(event);
+      });
+      reader.on("close", () => this.readerClosed());
+      this.readersPending += 1;
+    }
+
+    if (child.stderr) {
+      const reader = createInterface({ input: child.stderr });
+      reader.on("line", (line) => {
+        const trimmed = line.trim();
+        if (trimmed.length > 0) this.handlers.onStderr(trimmed);
+      });
+      reader.on("close", () => this.readerClosed());
+      this.readersPending += 1;
+    }
+
+    child.on("error", (error) => {
+      this.handlers.onStderr(`failed to launch ${this.binary}: ${error.message}`);
+      this.processExited = true;
+      this.reportExitIfDrained();
+    });
+
+    // agy exits after an error result, so the next turn can be written into a pipe whose reader is
+    // gone. Without a listener that EPIPE is an unhandled 'error' event and takes the plugin down.
+    child.stdin?.on("error", (error) => {
+      this.stdinClosed = true;
+      this.handlers.onStderr(`agy stdin closed: ${error.message}`);
+    });
+
+    child.on("exit", (code, signal) => {
+      this.exitInfo = { code, signal };
+      this.processExited = true;
+      this.reportExitIfDrained();
+    });
+  }
+
+  /**
+   * Write one user turn. Rejects when the child's stdin is gone, so a turn aimed at a process that
+   * already gave up fails the turn instead of disappearing into the pipe.
+   */
+  async writeTurn(text: string): Promise<void> {
+    const stdin = this.child?.stdin;
+    if (!stdin || !this.acceptsInput) {
+      throw new Error("agy process is not running or its stdin is closed");
+    }
+    const written = Promise.withResolvers<void>();
+    stdin.write(encodeUserTurn(text), (error) => {
+      if (error) {
+        this.stdinClosed = true;
+        written.reject(error);
+        return;
+      }
+      written.resolve();
+    });
+    await written.promise;
+  }
+
+  /** Interrupt the running turn. agy reports `result.error = "interrupted"` and exits. */
+  async interrupt(): Promise<void> {
+    const child = this.child;
+    if (!child) return;
+    const exited = this.exitPromise;
+
+    child.kill("SIGINT");
+    const timer = setTimeout(() => {
+      if (this.child) this.child.kill("SIGKILL");
+    }, SIGKILL_GRACE_MS);
+
+    try {
+      if (exited) await Promise.race([exited, delay(SIGKILL_GRACE_MS + 1_000)]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** Terminate immediately and release streams. Safe to call repeatedly. */
+  async dispose(): Promise<void> {
+    this.disposed = true;
+    const child = this.child;
+    const exited = this.exitPromise;
+    if (child) {
+      child.stdin?.end();
+      child.kill("SIGKILL");
+    }
+    if (exited) await Promise.race([exited, delay(SIGKILL_GRACE_MS)]);
+  }
+
+  private readerClosed(): void {
+    this.readersPending -= 1;
+    this.reportExitIfDrained();
+  }
+
+  /**
+   * agy emits its terminal `result` and then exits, so the exit must not be reported until every
+   * buffered stdout line has been delivered. Otherwise the exit path would race the result and
+   * fail a turn that actually completed.
+   */
+  private reportExitIfDrained(): void {
+    if (this.reported) return;
+    if (!this.processExited || this.readersPending > 0) return;
+    this.reported = true;
+    this.child = null;
+    const resolve = this.resolveExit;
+    this.resolveExit = null;
+    this.handlers.onExit(this.exitInfo);
+    resolve?.();
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

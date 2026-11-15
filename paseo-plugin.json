@@ -1,0 +1,8 @@
+{
+  "id": "super-antigravity",
+  "name": "Super Antigravity",
+  "media": [],
+  "requirements": {
+    "paseo": ">=0.15.4"
+  }
+}
